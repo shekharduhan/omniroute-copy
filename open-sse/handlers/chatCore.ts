@@ -56,6 +56,7 @@ import {
   getHeaderValueCaseInsensitive,
   resolveCompressionHeader,
   resolveNoLogEnabled,
+  isGlobalNoLogEnabled,
 } from "./chatCore/headers.ts";
 
 import {
@@ -256,7 +257,11 @@ import { applyPostTranslationCompression } from "./chatCore/postTranslationCompr
 import { isJsonRecord } from "./chatCore/nonStreamingResponseParse.ts";
 import { recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats.ts";
 import { resolveUsageAgentContext } from "./chatCore/agentContext.ts";
-import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/db/models";
+import {
+  getModelNormalizeToolCallId,
+  getModelPreserveOpenAIDeveloperRole,
+  getModelNoLog,
+} from "@/lib/db/models";
 import { extractSessionAffinityKey } from "@/sse/services/auth";
 import { createManagedLeaseFence } from "./chatCore/managedLeaseFence.ts";
 
@@ -622,13 +627,29 @@ async function handleChatCoreInner({
   ): EffectiveServiceTier | null => resolveReportedServiceTierFor(provider, payload, maxDepth);
   let upstreamHttpSelection: HttpAttemptSelection | null = null;
   let providerResponse;
-  // Per-key no-log flag OR the per-request `x-omniroute-no-log` header. Resolved
-  // before agent-context extraction so a header-only no-log request also drops
-  // prompt-derived project/branch fields from usage attribution.
-  const noLogEnabled = resolveNoLogEnabled(apiKeyInfo, clientRawRequest?.headers ?? null);
-  const agentContext = resolveUsageAgentContext(body, clientRawRequest?.headers, {
-    noLog: noLogEnabled,
-  });
+  // Per-request `x-omniroute-no-log` header, per-key no-log flag, per-model,
+  // per-connection and global settings, OR-combined. The full decision is
+  // resolved AFTER background-redirect / Copilot-auto / lifecycle have
+  // finalized the model (see recompute below), so the per-model flag applies
+  // to the model actually routed to, not the requested alias.
+  const settingsForNoLog = cachedSettings ?? (await getCachedSettings());
+  let noLogEnabled = false;
+  let agentContext = null;
+  const resolveNoLogDecision = () => {
+    // Most specific rung first: request > key > model > connection > global.
+    noLogEnabled = resolveNoLogEnabled({
+      headers: clientRawRequest?.headers ?? null,
+      apiKeyInfo,
+      modelNoLog: getModelNoLog(provider || "", model || "", sourceFormat),
+      connectionNoLog:
+        (credentials?.providerSpecificData as Record<string, unknown> | null | undefined)?.noLog ===
+        true,
+      globalNoLog: isGlobalNoLogEnabled(settingsForNoLog),
+    });
+    agentContext = resolveUsageAgentContext(body, clientRawRequest?.headers, {
+      noLog: noLogEnabled,
+    });
+  };
   // Failure usage record building extracted to chatCore/failureUsage.ts (#3501); the handler keeps
   // the fire-and-forget save + computes latencyMs, so the call sites stay byte-identical.
   const persistFailureUsage = (
@@ -873,6 +894,10 @@ async function handleChatCoreInner({
   // upstream never returns response headers.
   // Use credentials.connectionId as a fallback so that requests without an
   // explicit session-level connectionId still register in the pendingRequests map.
+  // Model is now final (post background-redirect, Copilot auto, lifecycle):
+  // resolve the five-tier no-log decision against the routed model and rebuild
+  // the agent context with it, before detailedLoggingEnabled consumes it.
+  resolveNoLogDecision();
   const pendingConnId = connectionId || credentials?.connectionId || null;
   const pendingRequestId =
     trackPendingRequest(model, provider, pendingConnId, true, {
