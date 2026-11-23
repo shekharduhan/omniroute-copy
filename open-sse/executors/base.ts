@@ -130,6 +130,7 @@ import { applyClineProtocolHeaders } from "@/shared/utils/clineAuth";
 import { isProbeContext } from "@/shared/utils/probeOrigin";
 import { assertDispatchUrlAllowed, dispatchGuarded } from "./dispatchPin.ts";
 import { dispatchWithGzipBody } from "./base/gzipRequestBody.ts";
+import { dispatchWithZstdBody } from "./base/zstdRequestBody.ts";
 // Header helpers extracted to a pure leaf; re-exported for external importers
 // (executors + tests) that import them from "./base.ts".
 export {
@@ -162,6 +163,7 @@ import {
 } from "./base/fieldDowngradeRecovery.ts";
 import { applyAdvisorUndecryptableRecovery } from "./base/advisorRecovery.ts";
 import { stripRedactThinkingBetaForVisibleThinking } from "./base/redactThinkingBeta.ts";
+import { getRecoveryLimiter } from "../services/recoveryRatioLimiter.ts";
 
 function parseSerializedBody(bodyString: string): unknown {
   try {
@@ -788,6 +790,8 @@ export class BaseExecutor {
     let activeCredentials = credentials;
     // Track per-URL intra-retry attempts to avoid infinite loops
     const retryAttemptsByUrl: Record<number, number> = {};
+    // Opt-in recovery-storm limiter: the URLs whose first send was already counted.
+    const initialSentUrls = new Set<number>();
     // Claude OAuth usage wall (opt-in per connection): see ./claudeUsageLimit.ts.
     const claudeUsageLimit = new ClaudeUsageLimitGuard(this.provider, log);
 
@@ -1053,18 +1057,20 @@ export class BaseExecutor {
               requestCredentials,
               (url, init) =>
                 dispatchWithGzipBody(this.provider, url, init, (gzipUrl, gzipInit) =>
-                  observeProviderHttpSend(
-                    {
-                      provider: this.provider,
-                      model:
-                        typeof (serializedBody as Record<string, unknown> | null)?.model ===
-                        "string"
-                          ? String((serializedBody as Record<string, unknown>).model)
-                          : model,
-                      connectionId: requestCredentials?.connectionId ?? null,
-                      endpoint: "unknown",
-                    },
-                    () => this.dispatchRequest(gzipUrl, gzipInit, requestCredentials)
+                  dispatchWithZstdBody(this.provider, gzipUrl, gzipInit, (zstdUrl, zstdInit) =>
+                    observeProviderHttpSend(
+                      {
+                        provider: this.provider,
+                        model:
+                          typeof (serializedBody as Record<string, unknown> | null)?.model ===
+                          "string"
+                            ? String((serializedBody as Record<string, unknown>).model)
+                            : model,
+                        connectionId: requestCredentials?.connectionId ?? null,
+                        endpoint: "unknown",
+                      },
+                      () => this.dispatchRequest(zstdUrl, zstdInit, requestCredentials)
+                    )
                   )
                 )
             )(requestUrl, optionsWithSignal);
@@ -1619,6 +1625,12 @@ export class BaseExecutor {
           await gateOutboundRequest(`agentrouter:${url}`);
         }
 
+        // Opt-in recovery-storm limiter: every re-run of this urlIndex (WAF, 429 and Claude
+        // usage-wall retries) reuses the same send, so only the first one is an initial send.
+        if (!initialSentUrls.has(urlIndex)) {
+          initialSentUrls.add(urlIndex);
+          getRecoveryLimiter(this.provider)?.noteInitial();
+        }
         let response = await fetchWithStartTimeout(url, fetchOptions);
 
         if (openrouterFreeWindowAccountKey) {
@@ -1824,7 +1836,10 @@ export class BaseExecutor {
           (retryAttemptsByUrl[urlIndex] ?? 0) < BaseExecutor.WAF_RETRY_CONFIG.maxAttempts
         ) {
           const wafErrText = await readErrorBodyText(response.clone()).catch(() => "");
-          if (/content[_-]blocked/i.test(wafErrText)) {
+          if (
+            /content[_-]blocked/i.test(wafErrText) &&
+            (getRecoveryLimiter(this.provider)?.tryRecovery() ?? true)
+          ) {
             retryAttemptsByUrl[urlIndex] = (retryAttemptsByUrl[urlIndex] ?? 0) + 1;
             const wafAttempt = retryAttemptsByUrl[urlIndex];
             const wafBackoff = BaseExecutor.jitterRetryDelayMs(
@@ -1849,7 +1864,8 @@ export class BaseExecutor {
           !skipUpstreamRetry &&
           response.status === HTTP_STATUS.RATE_LIMITED &&
           (retryAttemptsByUrl[urlIndex] ?? 0) < BaseExecutor.RETRY_CONFIG.maxAttempts &&
-          !(await shouldSkipIntraRetryFor429(response))
+          !(await shouldSkipIntraRetryFor429(response)) &&
+          (getRecoveryLimiter(this.provider)?.tryRecovery() ?? true)
         ) {
           retryAttemptsByUrl[urlIndex] = (retryAttemptsByUrl[urlIndex] ?? 0) + 1;
           const attempt = retryAttemptsByUrl[urlIndex];
