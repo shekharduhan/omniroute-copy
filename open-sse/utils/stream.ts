@@ -123,6 +123,12 @@ import { createSSEOutputSink } from "./sseOutputSink.ts";
 import { normalizeArrayContentChunk } from "./arrayContentDelta.ts";
 import { drainTranslateFlushTail } from "./translateFlushTail.ts";
 import { restoreResponsesToolNames } from "../translator/helpers/responsesToolNameRestore.ts";
+import { withBuyerCostMicro, type StreamCompletePayload } from "./streamCompletePayload.ts";
+import {
+  readBuyerCostMicro,
+  stripBuyerCostMicro,
+  registerStreamBuyerCost,
+} from "./buyerCostMicro.ts";
 
 function isLateOutputProbeEnabled(): boolean {
   try {
@@ -169,37 +175,6 @@ type StreamLogger = {
   appendProviderChunk?: (value: string) => void;
   appendConvertedChunk?: (value: string) => void;
   appendOpenAIChunk?: (value: string) => void;
-};
-
-type StreamCompletePayload = {
-  status: number;
-  usage: unknown;
-  /** Minimal response body for call log (streaming: usage + note; non-streaming not used) */
-  responseBody?: unknown;
-  providerPayload?: unknown;
-  clientPayload?: unknown;
-  error?: string | null;
-  errorCode?: string | null;
-  /**
-   * Time-to-first-forwarded-SSE-chunk in ms, or null when nothing was forwarded.
-   * NOT token-level TTFT — see open-sse/utils/streamTiming.ts for what is measured.
-   */
-  ttft?: number | null;
-  firstOutputMs?: number | null; // StreamTiming.firstOutputMs(); the caller adds pre-stream time
-  /** Mean inter-chunk gap in ms (chunk-latency proxy for ITL), or null. */
-  itlMs?: number | null;
-  /** True when the stream was interrupted (timeout/abort/error) before a clean finish. */
-  interrupted?: boolean;
-  cacheEvidence?: "hit" | "miss" | "unreported" | "invalid";
-  /**
-   * Encrypted-reasoning observation (Responses opaque `reasoning` items):
-   * flag when seen, wall-clock added→done delta when paired. Efforts are
-   * read at the sink from the request bodies — never threaded here.
-   */
-  reasoningMeta?: {
-    encryptedSeen: boolean;
-    durationMs: number | null;
-  } | null;
 };
 
 /** Queue budget every provider used before `streamBufferBytes` existed. */
@@ -854,7 +829,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     connectionId = null,
     apiKeyInfo = null,
     body = null,
-    onComplete = null,
+    onComplete: completionCallback = null,
     onFailure = null,
     dropResponsesCommentary,
     customToolNames = new Set<string>(),
@@ -862,6 +837,8 @@ export function createSSEStream(options: StreamOptions = {}) {
     streamBufferBytes = DEFAULT_STREAM_BUFFER_BYTES,
     pendingRequestId = null,
   } = options;
+  let buyerCostMicro: number | null = null;
+  const onComplete = withBuyerCostMicro(completionCallback, () => buyerCostMicro);
   // Request-body-size metric (for monitoring payload size distribution & correlation with TTFT).
   // The size is JSON-serialised byte count; stored as a performance mark detail so monitoring
   // tools can query performance.getEntriesByType("mark") filtered by name.
@@ -1002,10 +979,18 @@ export function createSSEStream(options: StreamOptions = {}) {
   const nativeClaudeUsage = createNativeClaudeUsageTracker(body);
   const nativeContent = createGeneratedContentTracker();
   const observedContentLength = () => nativeContent.getLength();
+  const observeBuyerCostMicro = (payload: unknown) => {
+    const reportedCost = readBuyerCostMicro(payload);
+    if (reportedCost === undefined) return false;
+    buyerCostMicro = reportedCost;
+    return true;
+  };
   const observeProviderPayload = (payload: unknown) => {
+    const reportedBuyerCost = observeBuyerCostMicro(payload);
     nativeClaudeUsage.observe(payload);
     nativeContent.observe(payload);
     providerPayloadCollector.push(payload);
+    if (reportedBuyerCost && mode === STREAM_MODE.TRANSLATE) stripBuyerCostMicro(payload);
   };
   // Accounting uses native receipt evidence rather than a client projection.
   const getAccountingUsage = (): UsageLike | null =>
@@ -1607,6 +1592,7 @@ export function createSSEStream(options: StreamOptions = {}) {
   ): boolean => {
     const failure = prepareTranslatedStreamFailure(payload);
     if (!failure) return false;
+    observeBuyerCostMicro(payload);
     failure.internalFailure.streamSnapshot ??= buildStreamFailureSnapshot(providerPayloadCollector);
     providerPayloadCollector.push(failure.providerPayload);
     const output = formatTranslatedStreamError(failure.record, sourceFormat);
@@ -3897,6 +3883,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     }),
     ...createByteLengthQueueStrategies(streamBufferBytes)
   );
+  registerStreamBuyerCost(sseStream, () => buyerCostMicro);
   trackStreamPartialUsage(sseStream, body, () => [getAccountingUsage(), observedContentLength()]);
   return registerStreamTiming(sseStream, timing);
 }
